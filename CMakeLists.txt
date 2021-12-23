@@ -502,8 +502,11 @@ check_type_size("long" SIZEOF_LONG BUILTIN_TYPES_ONLY LANGUAGE C)
 # Determine if this arch supports cache coherent DMA. This isn't really an
 # arch specific property, but for our purposes arches that do not support it
 # also do not define wmb/etc which breaks our compile.
+# As a special case s390x always has coherent DMA but needs linking for its wmb
 CHECK_C_SOURCE_COMPILES("
+#if !defined(__s390x__)
 #include \"${CMAKE_CURRENT_SOURCE_DIR}/util/udma_barrier.h\"
+#endif
  int main(int argc,const char *argv[]) {return 0;}"
   HAVE_COHERENT_DMA)
 
