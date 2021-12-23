@@ -198,12 +198,21 @@
 #define mmio_flush_writes() asm volatile("membar #StoreStore" ::: "memory")
 #elif defined(__aarch64__)
 #define mmio_flush_writes() asm volatile("dsb st" ::: "memory");
-#elif defined(__sparc__) || defined(__s390x__)
+#elif defined(__sparc__)
 #define mmio_flush_writes() asm volatile("" ::: "memory")
 #elif defined(__loongarch__)
 #define mmio_flush_writes() asm volatile("dbar 0" ::: "memory")
 #elif defined(__riscv)
 #define mmio_flush_writes() asm volatile("fence ow,ow" ::: "memory")
+#elif defined(__s390x__)
+#include "s390_mmio_insn.h"
+static inline void mmio_flush_writes(void)
+{
+	if (!s390_is_mio_supported)
+		s390_pciwb();
+	else
+		asm volatile("" ::: "memory");
+}
 #else
 #error No architecture specific memory barrier defines found!
 #endif
