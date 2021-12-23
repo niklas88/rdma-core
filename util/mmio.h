@@ -69,10 +69,64 @@
 #ifdef __s390x__
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/auxv.h>
 
-/* s390 requires a privileged instruction to access IO memory, these syscalls
-   perform that instruction using a memory buffer copy semantic.
+/* s390 requires special instructions to access IO memory. Originally there
+   were only privileged IO instructions that are exposed via special syscalls.
+   Starting with z15 there are also non-privileged memory IO (MIO) instructions
+   we can execute in user-space. Despite the hardware support this requires
+   support in the kernel. If MIO instructions are available is indicated in an
+   ELF hardware capability.
+ */
+extern int s390_mio_supported;
+
+union register_pair {
+	unsigned __int128 pair;
+	struct {
+		uint64_t even;
+		uint64_t odd;
+	};
+};
+
+/* The following pcilgi and pcistgi instructions allow IO memory access from
+   user-space but are only available on z15 and newer.
 */
+static inline uint64_t s390_pcilgi(const void *ioaddr, size_t len)
+{
+	union register_pair ioaddr_len = {.even = (uint64_t)ioaddr, .odd = len};
+	uint64_t val;
+
+	asm volatile (
+		"       .insn   rre,0xb9d60000,%[val],%[ioaddr_len]\n"
+		: [val] "=d" (val),
+		  [ioaddr_len] "+&d" (ioaddr_len.pair) :: "cc");
+	return val;
+}
+
+static inline void s390_pcistgi(void *ioaddr, uint64_t val, size_t len)
+{
+	union register_pair ioaddr_len = {.even = (uint64_t)ioaddr, .odd = len};
+
+	asm volatile (
+		"       .insn   rre,0xb9d40000,%[val],%[ioaddr_len]\n"
+		: [ioaddr_len] "+&d" (ioaddr_len.pair)
+		: [val] "d" (val)
+		: "cc", "memory");
+}
+
+/* This is the block store variant of unprivileged IO access instructions */
+static inline void s390_pcistbi(void *ioaddr, const void *data, size_t len)
+{
+	const uint8_t *src = data;
+
+	asm volatile (
+		"       .insn   rsy,0xeb00000000d4,%[len],%[ioaddr],%[src]\n"
+		: [len] "+d" (len)
+		: [ioaddr] "d" ((uint64_t *)ioaddr),
+		  [src] "Q" (*src)
+		: "cc");
+}
+
 static inline void s390_mmio_write(void *mmio_addr, const void *val,
 				   size_t length)
 {
@@ -90,38 +144,56 @@ static inline void s390_mmio_read(const void *mmio_addr, void *val,
 #define MAKE_WRITE(_NAME_, _SZ_)                                               \
 	static inline void _NAME_##_be(void *addr, __be##_SZ_ value)           \
 	{                                                                      \
-		s390_mmio_write(addr, &value, sizeof(value));                  \
+		if (likely(s390_mio_supported))                                \
+			s390_pcistgi(addr, value, sizeof(value));              \
+		else                                                           \
+			s390_mmio_write(addr, &value, sizeof(value));          \
 	}                                                                      \
 	static inline void _NAME_##_le(void *addr, __le##_SZ_ value)           \
 	{                                                                      \
-		s390_mmio_write(addr, &value, sizeof(value));                  \
+		if (likely(s390_mio_supported))                                \
+			s390_pcistgi(addr, value, sizeof(value));              \
+		else                                                           \
+			s390_mmio_write(addr, &value, sizeof(value));          \
 	}
 #define MAKE_READ(_NAME_, _SZ_)                                                \
 	static inline __be##_SZ_ _NAME_##_be(const void *addr)                 \
 	{                                                                      \
 		__be##_SZ_ res;                                                \
-		s390_mmio_read(addr, &res, sizeof(res));                       \
+		if (likely(s390_mio_supported))                                \
+			res = s390_pcilgi(addr, sizeof(res));                  \
+		else                                                           \
+			s390_mmio_read(addr, &res, sizeof(res));               \
 		return res;                                                    \
 	}                                                                      \
 	static inline __le##_SZ_ _NAME_##_le(const void *addr)                 \
 	{                                                                      \
 		__le##_SZ_ res;                                                \
-		s390_mmio_read(addr, &res, sizeof(res));                       \
+		if (likely(s390_mio_supported))                                \
+			res = s390_pcilgi(addr, sizeof(res));                  \
+		else                                                           \
+			s390_mmio_read(addr, &res, sizeof(res));               \
 		return res;                                                    \
 	}
 
+
 static inline void mmio_write8(void *addr, uint8_t value)
 {
-	s390_mmio_write(addr, &value, sizeof(value));
+	if (likely(s390_mio_supported))
+		s390_pcistgi(addr, value, sizeof(value));
+	else
+		s390_mmio_write(addr, &value, sizeof(value));
 }
 
 static inline uint8_t mmio_read8(const void *addr)
 {
 	uint8_t res;
-	s390_mmio_read(addr, &res, sizeof(res));
+	if (likely(s390_mio_supported))
+		res = s390_pcilgi(addr, sizeof(res));
+	else
+		s390_mmio_read(addr, &res, sizeof(res));
 	return res;
 }
-
 #else /* __s390x__ */
 
 #define MAKE_WRITE(_NAME_, _SZ_)                                               \
@@ -206,11 +278,47 @@ __le64 mmio_read64_le(const void *addr);
    be in ascending address order.
 */
 #ifdef __s390x__
-static inline void mmio_memcpy_x64(void *dest, const void *src, size_t bytecnt)
+#define S390_PCI_MAX_WRITE_SIZE 128
+static inline uint8_t s390_get_max_write_size(uint64_t src, uint64_t dst, int len, int max)
 {
-	s390_mmio_write(dest, src, bytecnt);
+	int count = len > max ? max : len, size = 1;
+
+	while (!(src & 0x1) && !(dst & 0x1) && ((size << 1) <= count)) {
+		dst = dst >> 1;
+		src = src >> 1;
+		size = size << 1;
+	}
+	return size;
 }
 
+static inline void mmio_memcpy_x64(void *dst, const void *src, size_t bytecnt)
+{
+	int size;
+
+	if (unlikely(!s390_mio_supported))
+		s390_mmio_write(dst, src, bytecnt);
+
+	while (bytecnt > 0) {
+		size = s390_get_max_write_size((uint64_t __force) dst,
+					       (uint64_t) src, bytecnt,
+					       S390_PCI_MAX_WRITE_SIZE);
+		if (size > 8) /* main path */
+			s390_pcistbi(dst, src, size);
+		else if (size == 8)
+			s390_pcistgi(dst, *(uint64_t *)src, 8);
+		else if (unlikely(size == 4))
+			s390_pcistgi(dst, *(uint32_t *)src, 4);
+		else if (unlikely(size == 2))
+			s390_pcistgi(dst, *(uint16_t *)src, 2);
+		else if (unlikely(size == 1))
+			s390_pcistgi(dst, *(uint8_t *)src, 1);
+
+		src += size;
+		dst += size;
+		bytecnt -= size;
+	}
+	return;
+}
 #elif defined(__aarch64__) || defined(__arm__)
 #include <arm_neon.h>
 

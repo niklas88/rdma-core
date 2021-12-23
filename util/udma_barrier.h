@@ -194,10 +194,29 @@
 #define mmio_flush_writes() asm volatile("membar #StoreStore" ::: "memory")
 #elif defined(__aarch64__)
 #define mmio_flush_writes() asm volatile("dsb st" ::: "memory");
-#elif defined(__sparc__) || defined(__s390x__)
+#elif defined(__sparc__)
 #define mmio_flush_writes() asm volatile("" ::: "memory")
 #elif defined(__loongarch__)
 #define mmio_flush_writes() asm volatile("dbar 0" ::: "memory")
+#elif defined(__s390x__)
+#include <sys/auxv.h>
+
+static inline void s390_pciwb(void)
+{
+#ifdef HWCAP_S390_PCI_MIO
+	/* As udma_barrier.h is stand alone we can't access
+	   the s390_mio_enabled variable used in mmio.h. Instead just check
+	   the ELF HWCAP directly which in testing seems to have very low
+	   overhead.
+	 */
+	if (!(getauxval(AT_HWCAP) & HWCAP_S390_PCI_MIO))
+		return;
+	asm volatile (".insn rre,0xb9d50000,0,0\n");
+#else
+	asm volatile("" ::: "memory");
+#endif
+}
+#define mmio_flush_writes() s390_pciwb()
 #else
 #error No architecture specific memory barrier defines found!
 #endif

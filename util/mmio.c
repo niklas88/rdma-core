@@ -6,6 +6,21 @@
 #include <pthread.h>
 #include <stdbool.h>
 
+#ifdef __s390x__
+#include <sys/auxv.h>
+
+int s390_mio_supported;
+
+static __attribute__((constructor)) void check_mio_supported(void)
+{
+#ifdef HWCAP_S390_PCI_MIO
+	s390_mio_supported = !!(getauxval(AT_HWCAP) & HWCAP_S390_PCI_MIO);
+#elif
+	s390_mio_supported = 0;
+#endif
+}
+#endif
+
 #if SIZEOF_LONG != 8
 
 static pthread_spinlock_t mmio_spinlock;
