@@ -6,6 +6,60 @@
 #include <pthread.h>
 #include <stdbool.h>
 
+#ifdef __s390x__
+#include <sys/auxv.h>
+#include <ccan/minmax.h>
+
+bool s390_is_mio_supported;
+
+static __attribute__((constructor)) void check_mio_supported(void)
+{
+#ifdef HWCAP_S390_PCI_MIO
+	s390_is_mio_supported = !!(getauxval(AT_HWCAP) & HWCAP_S390_PCI_MIO);
+#elif
+	s390_is_mio_supported = 0;
+#endif
+}
+
+#define S390_MAX_WRITE_SIZE 128
+#define S390_BOUNDARY_SIZE (1 << 12)
+#define S390_BOUNDARY_MASK (S390_BOUNDARY_SIZE - 1)
+
+static uint8_t get_max_write_size(void *dst, size_t len)
+{
+	uint16_t offset = ((uint64_t __force)dst) & S390_BOUNDARY_MASK;
+	size_t size = min_t(int, len, S390_MAX_WRITE_SIZE);
+
+	if (likely(offset + size <= S390_BOUNDARY_SIZE))
+		return size;
+
+	return S390_BOUNDARY_SIZE - offset;
+}
+
+void mmio_memcpy_x64(void *dst, const void *src, size_t bytecnt)
+{
+	size_t size;
+
+	if (!s390_is_mio_supported)
+		s390_mmio_write(dst, src, bytecnt);
+
+	/* Input is 8 byte aligned 64 byte chunks. The alignment matches the
+	 * requirements of pcistbi but we must not cross a 4K byte boundary.
+	 */
+	while (bytecnt > 0) {
+		size = get_max_write_size(dst, bytecnt);
+		if (size > 8)
+			s390_pcistbi(dst, src, size);
+		else
+			s390_pcistgi(dst, *(uint64_t *)src, 8);
+		src += size;
+		dst += size;
+		bytecnt -= size;
+	}
+	return;
+}
+#endif /* __s390x__ */
+
 #if SIZEOF_LONG != 8
 
 static pthread_spinlock_t mmio_spinlock;
